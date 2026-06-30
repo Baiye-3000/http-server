@@ -1,0 +1,2 @@
+This is a plain text file for concurrent GET testing.
+It should be served as text/plain by the HTTP server.
