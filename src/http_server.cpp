@@ -11,6 +11,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/epoll.h>
+#include <sys/stat.h>
 #include <unordered_map>
 #include <vector>
 #include <algorithm>
@@ -57,6 +58,12 @@ int HttpServer::create_listen_socket()
     int opt = 1;
     if (setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == -1) {
         std::cerr << "Failed to set SO_REUSEADDR: " << strerror(errno) << std::endl;
+        close(listen_fd_);
+        return -1;
+    }
+    // SO_REUSEPORT 允许多进程 bind 同一端口，由内核分发 accept
+    if (setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt)) == -1) {
+        std::cerr << "Failed to set SO_REUSEPORT: " << strerror(errno) << std::endl;
         close(listen_fd_);
         return -1;
     }
@@ -197,7 +204,7 @@ void HttpServer::mod_client_events(int client_fd, uint32_t events)
 {
     epoll_event event{};
     event.data.fd = client_fd;
-    event.events = EPOLLIN | EPOLLET;
+    event.events = events;
     epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, client_fd, &event);
 }
 
@@ -415,14 +422,32 @@ std::string HttpServer::serve_request(const std::string& request, bool keep_aliv
         path = "/index.html";
     }
     std::string fullpath = doc_root_ + path;
+    //使用缓存，减少文件读取次数
+    std::string ctype = get_content_type(fullpath);
+    if (ctype == "text/html") {
+        struct stat st {};
+        if (stat(fullpath.c_str(), &st) != 0 || !S_ISREG(st.st_mode)) {
+            return build_response("Not Found", "text/plain", 404, keep_alive);
+        }
+        if (json_cache_.contains(fullpath)) {
+            const JsonCacheEntry& entry = json_cache_[fullpath];
+            if (entry.mtime == st.st_mtime) {
+                return build_response(entry.json_body, "application/json", 200, keep_alive);
+            }
+        }
+        std::string body = load_file(fullpath);
+        if (body.empty()) {
+            return build_response("Not Found", "text/plain", 404, keep_alive);
+        }
+        JsonCacheEntry entry;
+        entry.json_body = html_to_json(body);
+        entry.mtime = st.st_mtime;
+        json_cache_[fullpath] = std::move(entry);
+        return build_response(json_cache_[fullpath].json_body, "application/json", 200, keep_alive);
+    }
     std::string body = load_file(fullpath);
     if (body.empty()) {
         return build_response("Not Found", "text/plain", 404, keep_alive);
-    }
-    std::string ctype = get_content_type(fullpath);
-    if (ctype == "text/html") {
-        std::string json_body = html_to_json(body);
-        return build_response(json_body, "application/json", 200, keep_alive);
     }
     return build_response(body, ctype, 200, keep_alive);
 }

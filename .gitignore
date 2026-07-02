@@ -19,6 +19,16 @@ Makefile
 # IDE/editor files
 .vscode/
 .idea/
+.cursor/
+
+# Deploy runtime artifacts (keep *.conf)
+deploy/*.log
+deploy/*.out
+deploy/*.txt
+deploy/*.pid
+deploy/cpu-sample.txt
+deploy/wrk_*.log
+deploy/failover_wrk_*.log
 
 # OS files
 Thumbs.db

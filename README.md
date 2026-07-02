@@ -1,5 +1,7 @@
 # 简单 HTTP 服务器开发
 
+> **开发前必读：[docs/HTTP-SERVER.md](docs/HTTP-SERVER.md)**（架构、原则、测试、经验沉淀）
+
 这是一个基于 C++ 和 Linux epoll 的简单 HTTP 服务器项目。
 
 ## 目标
@@ -63,6 +65,8 @@ curl -v http://192.168.61.217:8080/
 ```
 
 ## 关键点说明
+
+> 完整手册（开发前必读）：[docs/HTTP-SERVER.md](docs/HTTP-SERVER.md)
 
 ### epoll
 

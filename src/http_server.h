@@ -1,5 +1,6 @@
 #pragma once
 
+#include <ctime>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -9,6 +10,11 @@ struct Connection {
     std::string write_buffer;
     bool keep_alive = true;
     bool closed = false;
+};
+
+struct JsonCacheEntry {
+    std::string json_body;
+    time_t mtime = 0;
 };
 // 简单 HTTP 服务器类，基于 epoll 监听并发连接
 class HttpServer {
@@ -42,5 +48,6 @@ private:
     int listen_fd_;
     int epoll_fd_;
     std::unordered_map<int, Connection> client_conns_;
+    std::unordered_map<std::string, JsonCacheEntry> json_cache_;
 };
 
