@@ -1,7 +1,13 @@
 cmake_minimum_required(VERSION 3.10)
+
+# CentOS 8 默认 GCC 8 不支持 C++20，优先使用 gcc-toolset-10
+if(NOT DEFINED CMAKE_CXX_COMPILER AND EXISTS "/opt/rh/gcc-toolset-10/root/usr/bin/g++")
+    set(CMAKE_CXX_COMPILER "/opt/rh/gcc-toolset-10/root/usr/bin/g++")
+endif()
+
 project(simple_http_server CXX)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # =====================
@@ -29,5 +35,23 @@ target_include_directories(test_html_parser PRIVATE
     ${CMAKE_SOURCE_DIR}/src
 )
 
+add_executable(test_http_server
+    tests/test_http_server.cpp
+)
+
+target_include_directories(test_http_server PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+)
+
+target_link_libraries(test_http_server PRIVATE pthread)
+
+add_executable(test_http_server_stress
+    tests/test_http_server_stress.cpp
+)
+
+target_link_libraries(test_http_server_stress PRIVATE pthread)
+
 enable_testing()
 add_test(NAME html_parser_test COMMAND test_html_parser)
+add_test(NAME http_server_e2e COMMAND test_http_server)
+add_test(NAME http_server_stress COMMAND test_http_server_stress)
