@@ -1,11 +1,55 @@
 <!DOCTYPE html>
-<html > 
-<head>  
-<title>这是一个测试文件</title>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>个人主页</title>
 </head>
-<body>  
-    <h1>欢迎使用简单HTTP服务器</h1>
-    <p>这是另一个测试文件</p>
-    
+
+<body>
+    <header>
+        <h1>许浩捷</h1>
+        <p>欢迎来到我的主页</p>
+    </header>
+
+    <nav>
+        <ul>
+            <li><a href="/">首页</a></li>
+            <li><a href="/project">项目</a></li>
+            <li><a href="/contact">联系我</a></li>
+        </ul>
+    </nav>
+
+    <section id="profile">
+        <h2>个人信息</h2>
+
+        <div class="info">
+            <span>年龄：</span>
+            <span>22</span>
+        </div>
+
+        <div class="info">
+            <span>学校：</span>
+            <span>XX大学</span>
+        </div>
+    </section>
+
+    <section id="project">
+        <h2>项目经历</h2>
+
+        <article>
+            <h3>HTTP服务器</h3>
+            <p>基于C++、epoll实现高性能HTTP服务器。</p>
+        </article>
+
+        <article>
+            <h3>位置画像分析</h3>
+            <p>基于Spark进行人群画像分析。</p>
+        </article>
+    </section>
+
+    <footer>
+        <p>Copyright 2026</p>
+    </footer>
+
 </body>
 </html>

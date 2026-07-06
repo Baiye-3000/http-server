@@ -2,7 +2,8 @@
 #include <cassert>
 #include <fstream>
 #include <iostream>
-#include <sstream>
+#include <iterator>
+#include <nlohmann/json.hpp>
 #include <string>
 #include <vector>
 
@@ -16,31 +17,26 @@ static std::string read_file(const std::string& path)
     if (!in) {
         return "";
     }
-    std::ostringstream ss;
-    ss << in.rdbuf();
-    return ss.str();
+    return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
 }
 
-static std::string extract_title_from_json(const std::string& json)
+static std::string find_tag_text(const nlohmann::json& node, const std::string& tag)
 {
-    const std::string key = "\"title\": \"";
-    size_t pos = json.find(key);
-    if (pos == std::string::npos) {
+    if (!node.is_object()) {
         return "";
     }
-    pos += key.size();
-    size_t end = pos;
-    while (end < json.size()) {
-        if (json[end] == '\\') {
-            end += 2;
-            continue;
-        }
-        if (json[end] == '"') {
-            break;
-        }
-        ++end;
+    if (node.contains("tag") && node["tag"] == tag && node.contains("text")) {
+        return node["text"].get<std::string>();
     }
-    return json.substr(pos, end - pos);
+    if (node.contains("children")) {
+        for (const auto& child : node["children"]) {
+            const std::string text = find_tag_text(child, tag);
+            if (!text.empty()) {
+                return text;
+            }
+        }
+    }
+    return "";
 }
 
 int main()
@@ -64,18 +60,18 @@ int main()
         const std::string html = read_file(path);
         assert(!html.empty() && "failed to read html file");
 
-        const std::string json = html_to_json(html);
-        const std::string title = extract_title_from_json(json);
+        const nlohmann::json tree = nlohmann::json::parse(html_to_json(html));
+        const std::string title = find_tag_text(tree, "title");
 
         if (title != expected_title) {
             std::cerr << "FAIL " << filename << "\n"
                       << "  expected title: " << expected_title << "\n"
                       << "  actual title:   " << title << "\n"
-                      << "  json: " << json << "\n";
+                      << "  json: " << tree.dump(2) << "\n";
             assert(false);
         }
 
-        assert(!extract_title_from_json(json).empty());
+        assert(!title.empty());
         std::cout << "OK  " << filename << " -> title=\"" << title << "\"\n";
     }
 

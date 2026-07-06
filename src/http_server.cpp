@@ -1,5 +1,7 @@
 #include "http_server.h"
 #include "html_parser.h"
+#include <boost/asio/buffer.hpp>
+#include <boost/beast/core/buffers_to_string.hpp>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -16,6 +18,39 @@
 #include <vector>
 #include <algorithm>
 #include <cctype>
+
+namespace beast = boost::beast;
+namespace http = beast::http;
+namespace {
+
+class StringWriteStream {
+public:
+    explicit StringWriteStream(std::string& out) : out_(out) {}
+
+    template<class ConstBufferSequence>
+    std::size_t write_some(ConstBufferSequence const& buffers) {
+        boost::system::error_code ec;
+        return write_some(buffers, ec);
+    }
+
+    template<class ConstBufferSequence>
+    std::size_t write_some(ConstBufferSequence const& buffers, boost::system::error_code& ec) {
+        ec.clear();
+        std::size_t total = 0;
+        for (auto it = boost::asio::buffer_sequence_begin(buffers);
+             it != boost::asio::buffer_sequence_end(buffers); ++it) {
+            const auto buffer = *it;
+            out_.append(static_cast<const char*>(buffer.data()), buffer.size());
+            total += buffer.size();
+        }
+        return total;
+    }
+
+private:
+    std::string& out_;
+};
+
+}  // namespace
 
 // HttpServer 构造函数：初始化端口和文档根目录
 HttpServer::HttpServer(int port, const std::string& doc_root)
@@ -189,7 +224,7 @@ void HttpServer::accept_connection()
             std::cerr << "Failed to add client fd to epoll: " << strerror(errno) << std::endl;
             close(client_fd);
         }
-        client_conns_[client_fd] = Connection{};
+        client_conns_.try_emplace(client_fd);//添加客户端连接
     }
 }
 
@@ -204,7 +239,7 @@ void HttpServer::mod_client_events(int client_fd, uint32_t events)
 {
     epoll_event event{};
     event.data.fd = client_fd;
-    event.events = events;
+    event.events = events | EPOLLET;
     epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, client_fd, &event);
 }
 
@@ -231,38 +266,6 @@ bool HttpServer::flush_write_buffer(int client_fd)
     return true;
 }
 
-bool HttpServer::parse_keep_alive(const std::string& request)
-{
-    std::istringstream iss(request);
-    std::string method, path, version;
-    if (!(iss >> method >> path >> version)) {
-        return false;
-    }
-
-    bool default_keep_alive = (version.size() >= 8 && version.compare(0, 8, "HTTP/1.1") == 0);
-
-    std::string lower = request;
-    std::transform(lower.begin(), lower.end(), lower.begin(),
-                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-
-    const std::string marker = "\r\nconnection:";
-    size_t pos = lower.find(marker);
-    if (pos == std::string::npos) {
-        return default_keep_alive;
-    }
-
-    pos += marker.size();
-    size_t line_end = lower.find("\r\n", pos);
-    std::string connection = lower.substr(pos, line_end - pos);
-    if (connection.find("close") != std::string::npos) {
-        return false;
-    }
-    if (connection.find("keep-alive") != std::string::npos) {
-        return true;
-    }
-    return default_keep_alive;
-}
-
 // handle_client: 读取请求、生成响应；长连接下同一 fd 可处理多个请求
 void HttpServer::handle_client(int client_fd)
 {
@@ -270,23 +273,24 @@ void HttpServer::handle_client(int client_fd)
         return;
     }
     Connection& conn = client_conns_[client_fd];
-    //如果发送缓冲区有数据，先发完。
+    //如果发送缓冲区有数据，先发完。因为是上一个连接未发完的数据
     if (!conn.write_buffer.empty()) {
         if (!flush_write_buffer(client_fd)) {
-            mod_client_events(client_fd, EPOLLIN | EPOLLOUT);
-            return;
+            mod_client_events(client_fd, EPOLLIN | EPOLLOUT);//监听客户端发请求和发送数据
+            return;//返回，等待下一次事件到来。避免一直while等send成功，导致cpu占用过高。
         }
-        mod_client_events(client_fd, EPOLLIN);
-
-        if (!conn.keep_alive) {
+        mod_client_events(client_fd, EPOLLIN);//监听客户端发请求
+//那就不需要继续监听 EPOLLOUT。
+//因为 socket 大部分时间都是“可写”的，如果一直监听 EPOLLOUT，epoll 会频繁通知你，浪费 CPU。
+        if (!conn.keep_alive) {//这就是那个定义结构体的优点，可以方便的判断是否是长连接
             close_connection(client_fd);
             return;
         }
     }
 
     while (true) {
-        std::string request = parse_request(client_fd);
-        if (request.empty()) {
+        std::optional<HttpRequest> request = parse_request(client_fd);
+        if (!request) {
             if (conn.closed) {
                 close_connection(client_fd);
                 return;
@@ -294,8 +298,8 @@ void HttpServer::handle_client(int client_fd)
             break;
         }
 
-        conn.keep_alive = parse_keep_alive(request);
-        std::string response = serve_request(request, conn.keep_alive);
+        conn.keep_alive = request->keep_alive();
+        std::string response = serve_request(*request, conn.keep_alive);
         conn.write_buffer += response;
 
         if (!flush_write_buffer(client_fd)) {
@@ -308,54 +312,63 @@ void HttpServer::handle_client(int client_fd)
             return;
         }
 
-        if (conn.read_buffer.find("\r\n\r\n") == std::string::npos) {
+        if (conn.read_buffer.size() == 0) {//如果读缓冲区为空，则退出循环
             break;
         }
     }
 }
 
-// parse_request: 从连接读缓冲区读取完整 HTTP 请求头，支持分片接收
-std::string HttpServer::parse_request(int client_fd)
+// parse_request: Boost.Beast 解析 HTTP 请求头，支持分片与 keep-alive 后续请求
+std::optional<HttpServer::HttpRequest> HttpServer::parse_request(int client_fd)
 {
-    char buffer[4096];
-    auto it = client_conns_.find(client_fd);
-    if (it == client_conns_.end()) {
-        return "";
+    if (!client_conns_.contains(client_fd)) {
+        return std::nullopt;
     }
-    std::string& request_buffer = it->second.read_buffer;
+    Connection& conn = client_conns_[client_fd];
+    if (!conn.parser) {//如果解析器不存在，创建一个
+        conn.parser.emplace();
+    }
 
     while (true) {
-        ssize_t bytes_read = recv(client_fd, buffer, sizeof(buffer), 0);
-        if (bytes_read > 0) {
-            request_buffer.append(buffer, static_cast<size_t>(bytes_read));
-            if (request_buffer.find("\r\n\r\n") != std::string::npos) {
-                break;
+        if (conn.read_buffer.size() > 0) {
+            boost::beast::error_code ec;
+            const std::size_t bytes_used = conn.parser->put(conn.read_buffer.data(), ec);//将读缓冲区数据放入解析器
+            if (ec) {
+                conn.closed = true;
+                return std::nullopt;
             }
+            conn.read_buffer.consume(bytes_used);//消费掉已解析的数据
+            if (conn.parser->is_done()) {
+                HttpRequest request = conn.parser->release();// 释放解析器，返回解析好的请求
+                conn.parser.emplace();//重新创建解析器
+                return request;//返回解析好的请求
+                //处理长连接，keep-alive为true，则继续解析下一个请求
+            }
+
+        }
+
+        char buffer[4096];
+        const ssize_t bytes_read = recv(client_fd, buffer, sizeof(buffer), 0);
+        if (bytes_read > 0) {
+            const auto out = conn.read_buffer.prepare(static_cast<std::size_t>(bytes_read));
+            boost::asio::buffer_copy(out, boost::asio::buffer(buffer, static_cast<std::size_t>(bytes_read)));
+            conn.read_buffer.commit(static_cast<std::size_t>(bytes_read));
             continue;
         }
 
         if (bytes_read == 0) {
-            it->second.closed = true;
-            return "";
+            conn.closed = true;
+            return std::nullopt;
         }
 
         if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            break;
+            return std::nullopt;
         }
 
         perror("recv: CONNECTION ERROR ");
-        it->second.closed = true;
-        return "";
+        conn.closed = true;
+        return std::nullopt;
     }
-
-    size_t end_of_headers = request_buffer.find("\r\n\r\n");
-    if (end_of_headers == std::string::npos) {
-        return "";
-    }
-
-    std::string request = request_buffer.substr(0, 4 + end_of_headers);
-    request_buffer.erase(0, 4 + end_of_headers);
-    return request;
 }
 
 // load_file: 从文档根目录读取文件内容，失败返回空字符串
@@ -382,42 +395,38 @@ static std::string get_content_type(const std::string& path) {
     return "text/plain";
 }
 
-// build_response: 根据状态码、内容类型和响应体构建完整 HTTP 响应字符串
+// build_response: Boost.Beast 序列化 HTTP 响应
 std::string HttpServer::build_response(const std::string& body, const std::string& content_type, int status_code, bool keep_alive) {
-    const char* status = (status_code == 200) ? "200 OK" : "404 Not Found";
-    std::string resp;
-    resp.reserve(body.size()+128);//提前赋予容量，减少扩容 
-   //  避免了+拼接字符串，需要构造临时对象str = str + "abc" 这样的写法通常会创建临时对象，并可能重新分配内存和复制已有内容
-    resp += "HTTP/1.1 ";
-    resp += status;
-    resp += "\r\n";
+    http::response<http::string_body> res;
+    switch (status_code) {
+        case 200: res.result(http::status::ok); break;
+        case 400: res.result(http::status::bad_request); break;
+        case 405: res.result(http::status::method_not_allowed); break;
+        default: res.result(http::status::not_found); break;
+    } 
+    res.version(11);
+    res.set(http::field::content_type, content_type);
+    res.keep_alive(keep_alive);
+    res.body() = body;
+    res.prepare_payload();
 
-    resp += "Content-Length: ";
-    resp += std::to_string(body.size());
-    resp += "\r\n";
-
-    resp += "Content-Type: ";
-    resp += content_type;
-    resp += "\r\n";
-
-    resp += keep_alive ? "Connection: keep-alive\r\n" : "Connection: close\r\n";
-    resp += "\r\n";
-
-    resp += body;
-
-    return resp;
+    std::string serialized;
+    serialized.reserve(body.size() + 128);
+    StringWriteStream stream(serialized);
+    http::response_serializer<http::string_body> sr{res};//序列化响应，创建序列化器
+    while (!sr.is_done()) {
+        http::write_some(stream, sr);//写入响应
+    }
+    return serialized;
 }
 
 // serve_request: 解析请求并生成 HTTP 响应
-std::string HttpServer::serve_request(const std::string& request, bool keep_alive) {
-    std::istringstream iss(request);
-    std::string method, path, version;
-    if (!(iss >> method >> path >> version)) {
-        return build_response("Bad Request", "text/plain", 400, false);
-    }
-    if (method != "GET") {
+std::string HttpServer::serve_request(const HttpRequest& request, bool keep_alive) {
+    if (request.method() != http::verb::get) {
         return build_response("Method Not Allowed", "text/plain", 405, keep_alive);
     }
+
+    std::string path = std::string(request.target());
     if (path == "/") {
         path = "/index.html";
     }

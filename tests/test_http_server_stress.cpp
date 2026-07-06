@@ -2,6 +2,7 @@
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <climits>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -124,11 +125,14 @@ long parse_content_length(const std::string& headers)
     size_t pos = 0;
     while (pos < headers.size()) {
         size_t line_end = headers.find("\r\n", pos);
-        if (line_end == std::string::npos) {
+        const size_t len = (line_end == std::string::npos)
+                               ? headers.size() - pos
+                               : line_end - pos;
+        if (len == 0) {
             break;
         }
-        std::string line = headers.substr(pos, line_end - pos);
-        pos = line_end + 2;
+        std::string line = headers.substr(pos, len);
+        pos = (line_end == std::string::npos) ? headers.size() : line_end + 2;
 
         std::string lower = line;
         for (char& c : lower) {
@@ -344,10 +348,25 @@ int main(int argc, char* argv[])
         return 1;
     }
     if (pid == 0) {
-        execl("./simple_http_server", "simple_http_server",
-              "8082", "../www", nullptr);
+        char exe_path[PATH_MAX] = {0};
+        if (readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1) <= 0) {
+            std::perror("readlink");
+            _exit(1);
+        }
+
+        std::string exe_dir = exe_path;
+        size_t pos = exe_dir.rfind('/');
+        if (pos != std::string::npos) {
+            exe_dir.resize(pos);
+        }
+
+        std::string server_path = exe_dir + "/simple_http_server";
+        std::string www_path = exe_dir + "/../www";
+
+        execl(server_path.c_str(), "simple_http_server",
+              "8082", www_path.c_str(), nullptr);
         std::perror("execl");
-        return 1;
+        _exit(1);
     }
 
     sleep(1);

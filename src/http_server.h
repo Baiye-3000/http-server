@@ -1,15 +1,21 @@
 #pragma once
 
+#include <boost/beast/core.hpp>
+#include <boost/beast/http.hpp>
 #include <ctime>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <unordered_map>
 
 struct Connection {
-    std::string read_buffer;
+    boost::beast::flat_buffer read_buffer;
+    std::optional<boost::beast::http::request_parser<boost::beast::http::string_body>> parser;
     std::string write_buffer;
     bool keep_alive = true;
     bool closed = false;
+
+    Connection() : parser(std::in_place) {}
 };
 
 struct JsonCacheEntry {
@@ -35,12 +41,11 @@ private:
     void close_connection(int client_fd);
     void mod_client_events(int client_fd, uint32_t events);
     bool flush_write_buffer(int client_fd);
-    bool parse_keep_alive(const std::string& request);
-
+    using HttpRequest = boost::beast::http::request<boost::beast::http::string_body>;//含有完整的请求头和请求体的请求
     // 构造响应、解析请求、服务请求、加载文件
     std::string build_response(const std::string& body, const std::string& content_type, int status_code, bool keep_alive);
-    std::string parse_request(int client_fd);
-    std::string serve_request(const std::string& request, bool keep_alive);
+    std::optional<HttpRequest> parse_request(int client_fd);
+    std::string serve_request(const HttpRequest& request, bool keep_alive);
     std::string load_file(const std::string& path);
 
     int port_;

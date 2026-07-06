@@ -1,37 +1,14 @@
 #include "html_parser.h"
-#include "pugixml.hpp"
-#include <cstdio>
-#include <cstring>
+#include <gumbo.h>
+#include <nlohmann/json.hpp>
 #include <string>
-#include <vector>
 
-static std::string escape_json(const std::string& text)
-{
-    std::string result;
-    result.reserve(text.size());
-    for (char c : text) {
-        switch (c) {
-            case '\"': result += "\\\""; break;
-            case '\\': result += "\\\\"; break;
-            case '\b': result += "\\b"; break;
-            case '\f': result += "\\f"; break;
-            case '\n': result += "\\n"; break;
-            case '\r': result += "\\r"; break;
-            case '\t': result += "\\t"; break;
-            default:
-                if (static_cast<unsigned char>(c) < 0x20) {
-                    char buf[7];
-                    snprintf(buf, sizeof(buf), "\\u%04x", c);
-                    result += buf;
-                } else {
-                    result.push_back(c);
-                }
-        }
-    }
-    return result;
-}
+using json = nlohmann::json;
 
-static std::string trim(const std::string& value)
+namespace {
+
+// 去除字符串前后空格，只处理空格字符 ' '
+std::string trim(const std::string& value)
 {
     size_t begin = 0;
     while (begin < value.size() && value[begin] == ' ') {
@@ -44,141 +21,103 @@ static std::string trim(const std::string& value)
     return value.substr(begin, end - begin);
 }
 
-static bool is_heading_tag(const char* name)
+// 获取元素节点的标签名，非元素节点返回空字符串
+std::string node_tag(const GumboNode* node)
 {
-    if (name == nullptr || name[0] != 'h') {
-        return false;
+    if (node->type == GUMBO_NODE_ELEMENT) {
+        return gumbo_normalized_tagname(node->v.element.tag);
     }
-    return name[1] >= '1' && name[1] <= '6' && name[2] == '\0';
+    return "";
 }
 
-static std::string extract_title(const pugi::xml_document& doc)
+// 收集当前节点直接子节点中的文本内容，并去掉首尾空格
+std::string collect_text(const GumboNode* node)
 {
-    pugi::xpath_node title_node = doc.select_node("//title");
-    if (!title_node) {
-        return "";
+    std::string text;
+    const GumboVector* children = &node->v.element.children;
+    for (unsigned int i = 0; i < children->length; ++i) {
+        const GumboNode* child = static_cast<const GumboNode*>(children->data[i]);
+        if (child->type == GUMBO_NODE_TEXT || child->type == GUMBO_NODE_WHITESPACE) {
+            text += child->v.text.text;
+        }
     }
-    return trim(title_node.node().child_value());
+    return trim(text);
 }
 
-static pugi::xml_node find_body_node(const pugi::xml_document& doc)
+// 将 HTML 元素节点转换为 JSON 对象
+// 如果元素有子元素，则生成 children 数组；否则生成 text 字段
+json element_to_json(const GumboNode* node)
 {
-    pugi::xml_node body = doc.select_node("//body").node();
-    if (body) {
-        return body;
-    }
+    json obj;
+    obj["tag"] = node_tag(node);
 
-    pugi::xml_node html = doc.child("html");
-    if (html) {
-        body = html.child("body");
-        if (body) {
-            return body;
+    json children = json::array();
+    const GumboVector* child_nodes = &node->v.element.children;
+    for (unsigned int i = 0; i < child_nodes->length; ++i) {
+        const GumboNode* child = static_cast<const GumboNode*>(child_nodes->data[i]);
+        if (child->type == GUMBO_NODE_ELEMENT || child->type == GUMBO_NODE_TEMPLATE) {
+            children.push_back(element_to_json(child));
         }
     }
-    return pugi::xml_node();
+
+    if (!children.empty()) {
+        obj["children"] = std::move(children);
+        return obj;
+    }
+
+    const std::string text = collect_text(node);
+    if (!text.empty()) {
+        obj["text"] = text;
+    }
+    return obj;
 }
 
-static void collect_node(
-    const pugi::xml_node& node,
-    std::vector<std::string>& headings,
-    std::vector<std::string>& paragraphs)
+// 将解析树根节点转换为 JSON。若根节点本身是元素，直接转换；
+// 否则遍历 document 的子元素，可能生成单个根对象或 root 包装对象
+json root_to_json(const GumboNode* root)
 {
-    if (!node || node.type() != pugi::node_element) {
-        return;
+    if (root->type == GUMBO_NODE_ELEMENT) {
+        return element_to_json(root);
     }
 
-    const char* name = node.name();
-    if (is_heading_tag(name)) {
-        std::string text = trim(node.text().get());
-        if (!text.empty()) {
-            headings.push_back(text);
-        }
-        return;
-    }
-
-    if (std::strcmp(name, "p") == 0) {
-        std::string text = trim(node.text().get());
-        if (!text.empty()) {
-            paragraphs.push_back(text);
-        }
-        return;
-    }
-
-    if (std::strcmp(name, "div") == 0) {
-        bool has_element_child = false;
-        for (pugi::xml_node child = node.first_child(); child; child = child.next_sibling()) {
-            if (child.type() == pugi::node_element) {
-                has_element_child = true;
-                break;
-            }
-        }
-        if (!has_element_child) {
-            std::string text = trim(node.text().get());
-            if (!text.empty()) {
-                paragraphs.push_back(text);
-            }
-            return;
+    json roots = json::array();
+    const GumboVector* children = &root->v.element.children;
+    for (unsigned int i = 0; i < children->length; ++i) {
+        const GumboNode* child = static_cast<const GumboNode*>(children->data[i]);
+        if (child->type == GUMBO_NODE_ELEMENT || child->type == GUMBO_NODE_TEMPLATE) {
+            roots.push_back(element_to_json(child));
         }
     }
 
-    for (pugi::xml_node child = node.first_child(); child; child = child.next_sibling()) {
-        if (child.type() == pugi::node_element) {
-            collect_node(child, headings, paragraphs);
-        }
+    if (roots.empty()) {
+        return json::object();
     }
+    if (roots.size() == 1) {
+        return roots[0];
+    }
+
+    json wrapper;
+    wrapper["tag"] = "root";
+    wrapper["children"] = std::move(roots);
+    return wrapper;
 }
 
-static void collect_structured_content(
-    const pugi::xml_document& doc,
-    std::vector<std::string>& headings,
-    std::vector<std::string>& paragraphs)
-{
-    pugi::xml_node body = find_body_node(doc);
-    if (body) {
-        for (pugi::xml_node child = body.first_child(); child; child = child.next_sibling()) {
-            collect_node(child, headings, paragraphs);
-        }
-        return;
-    }
+}  // namespace
 
-    for (pugi::xml_node child = doc.first_child(); child; child = child.next_sibling()) {
-        collect_node(child, headings, paragraphs);
-    }
-}
-
-static std::string json_string_array(const std::vector<std::string>& items)
-{
-    std::string result = "[";
-    for (size_t i = 0; i < items.size(); ++i) {
-        if (i > 0) {
-            result += ", ";
-        }
-        result += "\"";
-        result += escape_json(items[i]);
-        result += "\"";
-    }
-    result += "]";
-    return result;
-}
-
+// 将 HTML 字符串解析为 JSON 字符串
 std::string html_to_json(const std::string& html_content)
 {
-    pugi::xml_document doc;
-    pugi::xml_parse_result result = doc.load_buffer(
+    // 使用 Gumbo 解析 HTML，支持不规范的 HTML 结构
+    GumboOutput* output = gumbo_parse_with_options(
+        &kGumboDefaultOptions,
         html_content.data(),
-        html_content.size(),
-        pugi::parse_default | pugi::parse_fragment);
+        html_content.size());
 
-    if (!result) {
-        return "{\"title\": \"\", \"body\": {\"headings\": [], \"paragraphs\": []}}";
+    if (output == nullptr || output->root == nullptr) {
+        return "{}";
     }
 
-    std::vector<std::string> headings;
-    std::vector<std::string> paragraphs;
-    collect_structured_content(doc, headings, paragraphs);
-
-    const std::string title = escape_json(extract_title(doc));
-    return "{\"title\": \"" + title + "\", \"body\": {\"headings\": "
-           + json_string_array(headings) + ", \"paragraphs\": "
-           + json_string_array(paragraphs) + "}}";
+    const json tree = root_to_json(output->root);
+    gumbo_destroy_output(&kGumboDefaultOptions, output);
+    return tree.dump(2);
 }
